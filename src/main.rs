@@ -3,6 +3,7 @@ use tokio::io;
 mod smoke_test;
 mod prime_time;
 mod means_to_an_end;
+mod budget_chat;
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
@@ -13,6 +14,7 @@ async fn main() -> io::Result<()> {
         0 => smoke_test::solve().await?,
         1 => prime_time::solve().await?,
         2 => means_to_an_end::solve().await?,
+        3 => budget_chat::solve().await?,
         _ => unreachable!(),
     }
 
