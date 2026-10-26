@@ -1,119 +1,217 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::{
+        HashMap,
+        hash_map::Entry::{Occupied, Vacant},
+    },
+    sync::Arc,
+};
 
-use tokio::{io::{self, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}, sync::mpsc::{self, Receiver, Sender}};
+use itertools::Itertools;
+use tokio::{
+    io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{
+        TcpListener, TcpStream,
+        tcp::{OwnedReadHalf, OwnedWriteHalf},
+    },
+    sync::mpsc,
+};
 
 enum ServerEvent {
-    Join {
-        username: String,
-        sender: mpsc::Sender<String>,
-    },
-    Leave {
-        username: String,
-    },
-    Chat {
-        username: String,
-        text: String,
-    },
+    NewUser(BufReader<TcpStream>, String),
+    UserMessage(String, String),
+    UserDisconnected(String),
 }
 
-async fn server_task(mut receiver: Receiver<ServerEvent>) -> io::Result<()> {
-    let mut users: HashMap<String, mpsc::Sender<String>> = HashMap::new();
+enum UserEvent {
+    Message(Arc<String>),
+}
 
-    while let Some(event) = receiver.recv().await {
-        match event {
-            ServerEvent::Join { username, sender } => {
-                if users.contains_key(&username) { continue; }
+fn valid_name(raw_name: &str) -> bool {
+    !raw_name.is_empty() && raw_name.chars().all(|c| char::is_ascii_alphanumeric(&c))
+}
 
-                let greeting = "* The room contains: ".to_string() + &users.keys().map(|s| s.as_str()).collect::<Vec<_>>().join(", ") + "\n";
-                let _ = sender.send(greeting).await;
+async fn ask_name(socket: TcpStream, tx: mpsc::Sender<ServerEvent>) -> io::Result<()> {
+    let mut buffer: Vec<u8> = vec![];
+    let mut stream = BufReader::new(socket);
 
-                for sender in users.values() {
-                    let _ = sender.send(format!("* {username} has entered the room\n")).await;
-                }                
+    stream
+        .write_all(b"Welcome to budgetchat! What shall I call you?\n")
+        .await?;
 
-                users.insert(username, sender);
-            },
+    let bytes_read = stream.read_until(b'\n', &mut buffer).await?;
+    if bytes_read == 0 {
+        return Ok(());
+    }
 
-            ServerEvent::Chat { username, text } => {
-                for (user, sender) in &users {
-                    if *user != username {
-                        let _ = sender.send(format!("[{username}] {text}\n")).await;
-                    }
-                }
-            },
+    match str::from_utf8(&buffer[0..bytes_read - 1]) {
+        Ok(raw_name) => {
+            if valid_name(raw_name) {
+                let _ = tx
+                    .send(ServerEvent::NewUser(stream, String::from(raw_name)))
+                    .await;
+            }
 
-            ServerEvent::Leave { username } => {
-                users.remove(&username);
-                for sender in users.values() {
-                    let _ = sender.send(format!("* {username} has left the room\n")).await;
+            Ok(())
+        }
+        Err(_) => Ok(()),
+    }
+}
+
+async fn listen(tx: mpsc::Sender<ServerEvent>) -> io::Result<()> {
+    let listener = TcpListener::bind("[::]:6969").await?;
+
+    loop {
+        if let Ok((socket, ..)) = listener.accept().await {
+            let tx_1 = tx.clone();
+
+            tokio::spawn(async move {
+                let _ = ask_name(socket, tx_1).await;
+            });
+        }
+    }
+}
+
+async fn read_loop(
+    name: String,
+    mut reader: BufReader<OwnedReadHalf>,
+    server_tx: mpsc::Sender<ServerEvent>,
+) -> io::Result<()> {
+    let mut buffer: Vec<u8> = vec![];
+
+    loop {
+        let bytes_read = reader.read_until(b'\n', &mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
+
+        let message = str::from_utf8(&buffer[0..bytes_read]).unwrap().to_string();
+        let name1 = name.clone();
+        let _ = server_tx
+            .send(ServerEvent::UserMessage(message, name1))
+            .await;
+
+        buffer.clear();
+    }
+}
+
+async fn write_loop(
+    mut writer: OwnedWriteHalf,
+    mut receiver: mpsc::Receiver<UserEvent>,
+) -> io::Result<()> {
+    loop {
+        while let Some(message) = receiver.recv().await {
+            match message {
+                UserEvent::Message(str) => {
+                    writer.write_all(str.as_bytes()).await?;
                 }
             }
         }
     }
+}
+
+async fn run_client(
+    name: String,
+    stream: BufReader<TcpStream>,
+    rx: mpsc::Receiver<UserEvent>,
+    server_tx: mpsc::Sender<ServerEvent>,
+) -> io::Result<()> {
+    let socket = stream.into_inner();
+    let (reader, writer) = socket.into_split();
+    let readstream = BufReader::new(reader);
+
+    let name1 = name.clone();
+    let server_tx1 = server_tx.clone();
+
+    let mut readloop = tokio::spawn(async move {
+        let _ = read_loop(name1, readstream, server_tx1).await;
+    });
+
+    let mut writeloop = tokio::spawn(async move {
+        let _ = write_loop(writer, rx).await;
+    });
+
+    tokio::select! {
+        _ = &mut readloop => {
+            writeloop.abort();
+        }
+
+        _ = &mut writeloop => {
+            readloop.abort();
+        }
+    }
+
+    let _ = server_tx.try_send(ServerEvent::UserDisconnected(name));
 
     Ok(())
 }
 
-async fn read_username(socket: &mut TcpStream) -> io::Result<Option<String>> {
-    socket.write_all(b"Welcome to budgetchat! What shall I call you?\n").await?;
+async fn server() -> io::Result<()> {
+    let (server_sender, mut server_receiver) = mpsc::channel::<ServerEvent>(32);
+    let mut users: HashMap<String, mpsc::Sender<UserEvent>> = HashMap::new();
 
-    let mut buff: Vec<u8> = Vec::new();
-    let mut temp = [0u8; 1024];
+    let sender_1 = server_sender.clone();
 
-    loop {
-        let bytes = socket.read(&mut temp).await?;
-
-        if bytes == 0 {
-            return Ok(None);
-        }
-
-        buff.extend_from_slice(&temp[..bytes]);
-
-        if let Some(pos) = buff.iter().position(|&b| b == b'\n') {
-            let name_str = std::str::from_utf8(&buff[..pos]).unwrap().to_owned();
-            if name_str.is_empty() || !name_str.chars().all(|c| c.is_ascii_alphanumeric()) {
-                return Ok(None)
-            }
-            
-            buff.drain(..=pos);
-            return Ok(Some(name_str.to_string()));
-        }
-    }
-}
-
-async fn client_task(mut socket: TcpStream, _addr: SocketAddr, tx: Sender<ServerEvent>) -> io::Result<()> {
-    let username = match read_username(&mut socket).await? {
-        Some(u) => u,
-        None => return Ok(()),
-    };
-    let (client_tx, mut client_rx) = mpsc::channel(32);
-    let _ = tx.send(ServerEvent::Join { username: username.clone(), sender: client_tx.clone() }).await;
-
-    let mut buff: Vec<u8> = Vec::new();
-    let mut temp = [0u8; 2048];
+    tokio::spawn(async move {
+        let _ = listen(sender_1).await;
+    });
 
     loop {
-        tokio::select! {
-            // Server wants to send us something
-            Some(msg) = client_rx.recv() => {
-                socket.write_all(msg.as_bytes()).await?;
-            }
+        while let Some(event) = server_receiver.recv().await {
+            match event {
+                ServerEvent::NewUser(stream, name) => {
+                    let room_contains = Arc::new(format!(
+                        "* The room contains: {}\n",
+                        users.keys().join(", ")
+                    ));
 
-            // Client sent us something
-            result = socket.read(&mut temp) => {
-                let bytes = result?;
+                    match users.entry(name.clone()) {
+                        Occupied(_) => {}
+                        Vacant(e) => {
+                            let (user_tx, user_rx) = mpsc::channel::<UserEvent>(32);
+                            let user_tx1 = user_tx.clone();
 
-                if bytes == 0 {
-                    let _ = tx.send(ServerEvent::Leave { username }).await;
-                    return Ok(());
+                            e.insert_entry(user_tx);
+
+                            let name1 = name.clone();
+
+                            let server_tx = server_sender.clone();
+                            tokio::spawn(async move {
+                                let _ = run_client(name1, stream, user_rx, server_tx).await;
+                            });
+
+                            let _ = user_tx1.try_send(UserEvent::Message(room_contains));
+
+                            let user_joined =
+                                Arc::new(format!("* {} has entered the room.\n", name));
+
+                            for (user, sender) in &users {
+                                if *user == name {
+                                    continue;
+                                }
+                                let _ = sender.try_send(UserEvent::Message(user_joined.clone()));
+                            }
+                        }
+                    }
                 }
 
-                buff.extend_from_slice(&temp[..bytes]);
+                ServerEvent::UserDisconnected(dced) => {
+                    users.remove(&dced);
 
-                while let Some(pos) = buff.iter().position(|&b| b == b'\n') {
-                    let message = std::str::from_utf8(&buff[..pos]).unwrap().to_owned();
-                    buff.drain(..=pos);
-                    let _ = tx.send(ServerEvent::Chat { username: username.clone(), text: message.to_string() }).await;
+                    let user_left = Arc::new(format!("* {} has left the room\n", dced));
+
+                    for sender in users.values() {
+                        let _ = sender.try_send(UserEvent::Message(user_left.clone()));
+                    }
+                }
+
+                ServerEvent::UserMessage(message, from) => {
+                    let user_message = Arc::new(format!("[{}] {}", from, message));
+
+                    for (user, sender) in &users {
+                        if *user != from {
+                            let _ = sender.try_send(UserEvent::Message(user_message.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -121,25 +219,5 @@ async fn client_task(mut socket: TcpStream, _addr: SocketAddr, tx: Sender<Server
 }
 
 pub async fn solve() -> io::Result<()> {
-
-    let acc = TcpListener::bind("[::]:6969").await?;
-    
-    let (tx, rx) = mpsc::channel(32);
-
-    tokio::spawn(async move {
-        if let Err(e) = server_task(rx).await {
-            eprintln!("{}", e);
-        }
-    });
-
-    loop {
-        let (socket, addr) = acc.accept().await?;
-        let t = tx.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = client_task(socket, addr, t).await {
-                eprintln!("{}", e);
-            }
-        });
-    }
+    server().await
 }

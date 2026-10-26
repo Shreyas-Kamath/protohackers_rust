@@ -1,33 +1,30 @@
-use std::net::SocketAddr;
-
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
 
-async fn handle(mut socket: TcpStream, _client: SocketAddr) -> io::Result<()> {
-    let mut buff = [0u8; 4096];
-    println!("{_client} inside handle");
+async fn handle_client(mut socket: TcpStream) -> io::Result<()> {
+    let mut buffer = [0u8; 4096];
 
     loop {
-        let bytes = socket.read(&mut buff).await?;
-        if bytes == 0 { return Ok(()); }
+        let bytes_read = socket.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            return Ok(());
+        }
 
-        socket.write_all(&buff[..bytes]).await?;
+        socket.write_all(&buffer[..bytes_read]).await?;
     }
 }
 
 pub async fn solve() -> io::Result<()> {
-    let acc = TcpListener::bind("[::]:6969").await?;
+    let listener = TcpListener::bind("[::]:6969").await?;
 
     loop {
-        let (socket, addr) = acc.accept().await?;
-        println!("{addr} connected");
-
-        tokio::spawn(async move {
-            if let Err(e) = handle(socket, addr).await {
-                eprintln!("{}", e);
+        match listener.accept().await {
+            Ok((socket, ..)) => {
+                tokio::spawn(async move { handle_client(socket).await });
             }
-        });
+            Err(_) => {}
+        }
     }
 }

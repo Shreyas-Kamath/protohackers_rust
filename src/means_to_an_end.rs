@@ -1,62 +1,63 @@
-use std::{collections::BTreeMap, net::SocketAddr, ops::Bound::Included};
+use std::{collections::BTreeMap, ops::Bound::Included};
 
-use tokio::{io::{self, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use tokio::{
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+};
 
-async fn handle_req(mut socket: TcpStream, _addr: SocketAddr) -> io::Result<()> {
-    let mut price_map: BTreeMap<i32, i32> = BTreeMap::new();
+async fn handle_client(mut socket: TcpStream) -> io::Result<()> {
+    let mut assets: BTreeMap<i32, i32> = BTreeMap::new();
 
-    let mut buff = [0u8; 9];
+    let mut buffer = [0u8; 9];
 
     loop {
-        let bytes = socket.read_exact(&mut buff).await?;
+        socket.read_exact(&mut buffer).await?;
 
-        if bytes == 0 {
-            return Ok(());
-        }
+        let l = i32::from_be_bytes(buffer[1..5].try_into().unwrap());
+        let r = i32::from_be_bytes(buffer[5..9].try_into().unwrap());
 
-        let left = i32::from_be_bytes(buff[1..=4].try_into().unwrap());
-        let right = i32::from_be_bytes(buff[5..=8].try_into().unwrap());
+        match buffer[0] {
+            b'I' => {
+                assets.insert(l, r);
+            }
 
-        match buff[0] {
-            b'I' => { price_map.insert(left, right); },
             b'Q' => {
-                if left > right {
+                if l > r {
                     socket.write_all(&0i32.to_be_bytes()).await?;
-                }
-                else {
-                    let (sum, count) = price_map
-                        .range((Included(left), Included(right)))
-                        .fold((0i64, 0usize), |(sum, count), (_, &price)| {
-                            (sum + (price as i64), count + 1)
-                    });
+                } else {
+                    let mut sum: i64 = 0;
+                    let mut counter: i64 = 0;
 
-                    if count == 0 {
+                    for (_, val) in assets.range((Included(l), Included(r))) {
+                        sum += *val as i64;
+                        counter += 1;
+                    }
+
+                    if counter == 0 {
                         socket.write_all(&0i32.to_be_bytes()).await?;
-                    }
-                    else {
-                        let avg = (sum / (count as i64)) as i32;
-                        socket.write_all(&avg.to_be_bytes()).await?;
+                    } else {
+                        sum /= counter;
+                        socket.write_all(&(sum as i32).to_be_bytes()).await?;
                     }
                 }
             }
 
-            _ => {
-                return Ok(())
-            }
+            _ => return Ok(()),
         }
     }
 }
 
 pub async fn solve() -> io::Result<()> {
-    let acc = TcpListener::bind("[::]:6969").await?;
+    let listener = TcpListener::bind("[::]:6969").await?;
 
     loop {
-        let (socket, addr) = acc.accept().await?;
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_req(socket, addr).await {
-                eprintln!("{}", e);
+        match listener.accept().await {
+            Ok((socket, ..)) => {
+                tokio::spawn(async move {
+                    let _ = handle_client(socket).await;
+                });
             }
-        });
-    }  
+            Err(_) => {}
+        }
+    }
 }

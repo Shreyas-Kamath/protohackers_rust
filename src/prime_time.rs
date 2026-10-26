@@ -1,101 +1,105 @@
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
-use tokio::{io::{self, AsyncReadExt, AsyncWriteExt}, net::{TcpListener, TcpStream}};
+use tokio::{
+    io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader},
+    net::{TcpListener, TcpStream},
+};
 
-#[derive(Debug, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
+#[serde(untagged)]
+enum Number {
+    Integer(i64),
+    Double(f64),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
 struct Request {
     method: String,
-    number: f64
+    number: Number,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Serialize, Deserialize)]
 struct Response {
-    method: &'static str,
-    prime: bool
+    method: String,
+    prime: bool,
 }
 
-fn is_prime(number: f64) -> bool {
-    if number.fract() != 0.0 {
-        return false;
-    }
+fn is_prime(num: Number) -> bool {
+    match num {
+        Number::Integer(n) => {
+            if n <= 1 {
+                return false;
+            }
+            if n <= 3 {
+                return true;
+            }
 
-    let n = number as i64;
+            if n % 2 == 0 || n % 3 == 0 {
+                return false;
+            }
 
-    if n < 2 {
-        return false;
-    }
+            let mut i: i64 = 5;
 
-    if n == 2 || n == 3 {
-        return true;
-    }
+            while i * i <= n {
+                if n % i == 0 || n % (i + 2) == 0 {
+                    return false;
+                }
+                i += 6;
+            }
 
-    if n % 2 == 0 || n % 3 == 0 {
-        return false;
-    }
-
-    let mut i = 5;
-
-    while i * i <= n {
-        if n % i == 0 || n % (i + 2) == 0 {
+            return true;
+        }
+        Number::Double(_) => {
             return false;
         }
-        i += 6;
     }
-    true
 }
 
-pub async fn handle_req(mut socket: TcpStream, _addr: SocketAddr) -> io::Result<()> {
-    let mut buff: Vec<u8> = Vec::new();
-    let mut temp = [0u8; 4096];
+async fn handle_client(socket: TcpStream) -> io::Result<()> {
+    let mut stream = BufReader::new(socket);
+    let mut buffer: Vec<u8> = vec![];
 
     loop {
-        let bytes = socket.read(&mut temp).await?;
-        if bytes == 0 { 
+        let bytes_read = stream.read_until(b'\n', &mut buffer).await?;
+        if bytes_read == 0 {
             return Ok(());
         }
 
-        buff.extend_from_slice(&temp[..bytes]);
+        match serde_json::from_slice::<Request>(&buffer[..bytes_read - 1]) {
+            Ok(request) => {
+                println!("{:?}", request);
 
-        while let Some(pos) = buff.iter().position(|&b| b == b'\n') {
-            let req: Result<Request, _> = serde_json::from_slice(&buff[..pos]);
-
-            if let Ok(res) = req {
-                if res.method != "isPrime" {
-                    socket.write_all(b"bye").await?;
+                if request.method != "isPrime" {
                     return Ok(());
-                }
+                };
 
                 let response = Response {
-                    method: "isPrime",
-                    prime: is_prime(res.number)
+                    method: "isPrime".to_string(),
+                    prime: is_prime(request.number),
                 };
-                
-                let mut res_json = serde_json::to_vec(&response)?;
-                res_json.push(b'\n');
-                socket.write_all(&res_json).await?;
 
-            } 
-            else {
-                socket.write_all(b"bye").await?;
-                return Ok(());
+                let serialized = serde_json::to_string(&response).unwrap() + "\n";
+                stream.write_all(serialized.as_bytes()).await?;
             }
 
-            buff.drain(..=pos);
+            Err(_) => {
+                return Ok(());
+            }
         }
+
+        buffer.drain(0..bytes_read);
     }
 }
 
 pub async fn solve() -> io::Result<()> {
-    let acc = TcpListener::bind("[::]:6969").await?;
-
+    let listener = TcpListener::bind("[::]:6969").await?;
     loop {
-        let (socket, addr) = acc.accept().await?;
-        println!("{addr} connected");
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_req(socket, addr).await {
-                eprintln!("{}", e);
+        match listener.accept().await {
+            Ok((socket, ..)) => {
+                tokio::spawn(async move {
+                    let _ = handle_client(socket).await;
+                });
             }
-        });
+            Err(_) => {}
+        }
     }
 }
